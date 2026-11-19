@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Estacion meteorologica</title>
+<style>
+  :root {
+    --fondo: #ffffff;
+    --texto: #1a1a1a;
+    --tarjeta: #f2f2f0;
+    --suave: #6b6b66;
+    --temp: #0f8aa8;
+    --hum: #2d9a4a;
+    --pres: #b07d00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fondo: #141414;
+      --texto: #f0f0ee;
+      --tarjeta: #202020;
+      --suave: #9a9a94;
+      --temp: #4fc3e0;
+      --hum: #5fd17a;
+      --pres: #e8b84a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--fondo);
+    color: var(--texto);
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .estado { font-size: 13px; color: var(--suave); margin-bottom: 16px; }
+  .rejilla {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 12px;
+  }
+  .tarjeta { background: var(--tarjeta); border-radius: 12px; padding: 14px; }
+  .nombre { font-size: 13px; color: var(--suave); }
+  .valor { font-size: 44px; font-weight: 600; line-height: 1.1; margin: 4px 0 8px; display: flex; flex-wrap: wrap; align-items: baseline; }
+  .unidad { font-size: 18px; font-weight: 400; color: var(--suave); margin-left: 4px; }
+  .valor-f { margin-left: auto; margin-right: 30px; padding-left: 12px; }
+  canvas { width: 100%; height: 110px; display: block; }
+</style>
+</head>
+<body>
+
+<h1>Estacion meteorologica</h1>
+<div class="estado" id="estado">Conectando...</div>
+
+<div class="rejilla">
+  <div class="tarjeta">
+    <div class="nombre">Temperatura</div>
+    <div class="valor"><span id="valor-temp">--</span><span class="unidad">C</span><span class="valor-f"><span id="valor-temp-f">--</span><span class="unidad">F</span></span></div>
+    <canvas id="graf-temp"></canvas>
+  </div>
+  <div class="tarjeta">
+    <div class="nombre">Humedad</div>
+    <div class="valor"><span id="valor-hum">--</span><span class="unidad">%</span></div>
+    <canvas id="graf-hum"></canvas>
+  </div>
+  <div class="tarjeta">
+    <div class="nombre">Presion</div>
+    <div class="valor"><span id="valor-pres">--</span><span class="unidad">hPa</span></div>
+    <canvas id="graf-pres"></canvas>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+  // ----- Debe ser IGUAL al MQTT_TEMA que pusiste en el Arduino -----
+  const TEMA = "estacion-r4-x7k2q9m4/datos";
+  // -----------------------------------------------------------------
+
+  const SERVIDOR = "wss://broker.hivemq.com:8884/mqtt";
+  const MAX_PUNTOS = 300;
+  const SIN_DATOS_MS = 3 * 60 * 1000;
+
+  const series = [
+    { clave: "t", id: "temp", decimales: 1, color: "--temp" },
+    { clave: "h", id: "hum",  decimales: 1, color: "--hum" },
+    { clave: "p", id: "pres", decimales: 1, color: "--pres" }
+  ];
+
+  let historial = cargarHistorial();
+  let ultimoMensaje = null;
+  let hayRetenido = false;
+  let conectado = false;
+
+  function cargarHistorial() {
+    try {
+      const guardado = localStorage.getItem("historial:" + TEMA);
+      if (guardado) {
+        const d = JSON.parse(guardado);
+        if (d && d.t && d.h && d.p) {
+          return d;
+        }
+      }
+    } catch (e) {}
+    return { t: [], h: [], p: [] };
+  }
+
+  function guardarHistorial() {
+    try {
+      localStorage.setItem("historial:" + TEMA, JSON.stringify(historial));
+    } catch (e) {}
+  }
+
+  function ponerValor(s, valor) {
+    document.getElementById("valor-" + s.id).textContent = valor.toFixed(s.decimales);
+    if (s.id === "temp") {
+      document.getElementById("valor-temp-f").textContent = (valor * 9 / 5 + 32).toFixed(1);
+    }
+  }
+
+  function dibujar(s) {
+    const lienzo = document.getElementById("graf-" + s.id);
+    const ratio = window.devicePixelRatio || 1;
+    const ancho = lienzo.clientWidth;
+    const alto = lienzo.clientHeight;
+    lienzo.width = ancho * ratio;
+    lienzo.height = alto * ratio;
+
+    const ctx = lienzo.getContext("2d");
+    ctx.scale(ratio, ratio);
+    ctx.clearRect(0, 0, ancho, alto);
+
+    const estilos = getComputedStyle(document.documentElement);
+    const colorLinea = estilos.getPropertyValue(s.color).trim();
+    const colorSuave = estilos.getPropertyValue("--suave").trim();
+    const datos = historial[s.clave];
+
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.fillStyle = colorSuave;
+
+    if (datos.length < 2) {
+      ctx.fillText("Esperando mas datos...", 4, alto / 2);
+      return;
+    }
+
+    let minimo = Math.min.apply(null, datos.map(function (p) { return p.v; }));
+    let maximo = Math.max.apply(null, datos.map(function (p) { return p.v; }));
+    if (maximo - minimo < 0.5) {
+      const medio = (maximo + minimo) / 2;
+      minimo = medio - 0.25;
+      maximo = medio + 0.25;
+    }
+
+    const margenX = 4;
+    const margenArriba = 16;
+    const margenAbajo = 16;
+    const x0 = datos[0].x;
+    const duracion = Math.max(datos[datos.length - 1].x - x0, 1);
+
+    ctx.strokeStyle = colorLinea;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    datos.forEach(function (p, i) {
+      const x = margenX + ((p.x - x0) / duracion) * (ancho - 2 * margenX);
+      const y = margenArriba + (1 - (p.v - minimo) / (maximo - minimo)) * (alto - margenArriba - margenAbajo);
+      if (i === 0) {
+        ctx.moveTo(x, y);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.stroke();
+
+    ctx.fillStyle = colorSuave;
+    ctx.fillText("max " + maximo.toFixed(s.decimales), 4, 11);
+    ctx.fillText("min " + minimo.toFixed(s.decimales), 4, alto - 3);
+  }
+
+  function formatearTiempo(segundos) {
+    if (segundos < 60) {
+      return segundos + " s";
+    }
+    const minutos = Math.floor(segundos / 60);
+    if (minutos < 60) {
+      return minutos + " min";
+    }
+    return Math.floor(minutos / 60) + " h " + (minutos % 60) + " min";
+  }
+
+  function actualizarEstado() {
+    const el = document.getElementById("estado");
+    if (!conectado) {
+      el.textContent = "Sin conexion con el servidor, reintentando...";
+      return;
+    }
+    if (ultimoMensaje === null) {
+      if (hayRetenido) {
+        el.textContent = "Conectado. Mostrando el ultimo dato guardado, esperando datos nuevos...";
+      } else {
+        el.textContent = "Conectado. Esperando datos del Arduino...";
+      }
+      return;
+    }
+    const transcurrido = Date.now() - ultimoMensaje;
+    const texto = formatearTiempo(Math.round(transcurrido / 1000));
+    if (transcurrido > SIN_DATOS_MS) {
+      el.textContent = "Sin datos recientes, el ultimo llego hace " + texto;
+    } else {
+      el.textContent = "Conectado. Ultimo dato hace " + texto;
+    }
+  }
+
+  function alRecibir(tema, mensaje, paquete) {
+    let datos;
+    try {
+      datos = JSON.parse(mensaje.toString());
+    } catch (e) {
+      return;
+    }
+
+    const ahora = Date.now();
+    const retenido = !!(paquete && paquete.retain);
+
+    series.forEach(function (s) {
+      const v = datos[s.clave];
+      if (typeof v !== "number") {
+        return;
+      }
+      ponerValor(s, v);
+      if (!retenido) {
+        historial[s.clave].push({ x: ahora, v: v });
+        if (historial[s.clave].length > MAX_PUNTOS) {
+          historial[s.clave].shift();
+        }
+      }
+      dibujar(s);
+    });
+
+    if (retenido) {
+      hayRetenido = true;
+    } else {
+      ultimoMensaje = ahora;
+      guardarHistorial();
+    }
+    actualizarEstado();
+  }
+
+  series.forEach(function (s) {
+    const datos = historial[s.clave];
+    if (datos.length > 0) {
+      ponerValor(s, datos[datos.length - 1].v);
+    }
+    dibujar(s);
+  });
+
+  window.addEventListener("resize", function () {
+    series.forEach(dibujar);
+  });
+
+  const cliente = mqtt.connect(SERVIDOR, {
+    clientId: "pagina-" + Math.random().toString(16).slice(2, 10),
+    reconnectPeriod: 3000,
+    connectTimeout: 10000
+  });
+
+  cliente.on("connect", function () {
+    conectado = true;
+    cliente.subscribe(TEMA);
+    actualizarEstado();
+  });
+  cliente.on("close", function () {
+    conectado = false;
+    actualizarEstado();
+  });
+  cliente.on("error", function () {
+    actualizarEstado();
+  });
+  cliente.on("message", alRecibir);
+
+  setInterval(actualizarEstado, 5000);
+</script>
+</body>
+</html>
